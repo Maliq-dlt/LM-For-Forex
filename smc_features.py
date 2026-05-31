@@ -433,7 +433,11 @@ def load_ohlcv_ccxt(symbol="BTC/USDT", timeframe="15m", limit=1500, exchange_id=
 
 def _synthetic_ohlcv(n=600, seed=0, symbol="BTC/USDT"):
     """Buat OHLCV sintetis (random walk) dengan parameter realistis per instrumen."""
-    rng = np.random.default_rng(seed)
+    # Decorrelate antar-instrumen: gabungkan seed dengan offset stabil dari simbol
+    # agar EUR/XAU/BTC tidak menghasilkan deret return yang berkorelasi sempurna.
+    import hashlib
+    sym_offset = int(hashlib.md5(symbol.encode()).hexdigest(), 16) % 1_000_000
+    rng = np.random.default_rng(seed + sym_offset)
     
     # Atur volatilitas, harga awal, dan wick khas tiap instrumen
     if "EUR" in symbol:

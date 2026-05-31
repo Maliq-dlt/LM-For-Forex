@@ -249,24 +249,47 @@ class HybridMLPipeline:
                 X_v = X_tr.iloc[-val_sz:]
                 y_v = y_tr.iloc[-val_sz:]
                 
-                t_cls = np.unique(y_t)
-                t_wts = compute_class_weight('balanced', classes=t_cls, y=y_t.to_numpy())
-                t_class_weights = dict(zip(t_cls, t_wts))
-                t_sample_weights = np.array([t_class_weights[val] for val in y_t])
-                
-                m = xgb.XGBClassifier(**p)
-                m.fit(X_t, y_t, sample_weight=t_sample_weights)
-                pr = m.predict(X_v)
-                from sklearn.metrics import f1_score
-                return f1_score(y_v, pr, average='weighted', zero_division=0)
+                try:
+                    t_cls = np.unique(y_t)
+                    t_wts = compute_class_weight('balanced', classes=t_cls, y=y_t.to_numpy())
+                    t_class_weights = dict(zip(t_cls, t_wts))
+                    t_sample_weights = np.array([t_class_weights[val] for val in y_t])
+                    
+                    from sklearn.preprocessing import LabelEncoder
+                    le = LabelEncoder()
+                    y_t_encoded = le.fit_transform(y_t)
+                    
+                    # Hapus objective dan num_class agar XGBoostClassifier menyesuaikan otomatis jika ada kelas absen
+                    p_copy = p.copy()
+                    p_copy.pop('num_class', None)
+                    p_copy.pop('objective', None)
+                    
+                    m = xgb.XGBClassifier(**p_copy)
+                    m.fit(X_t, y_t_encoded, sample_weight=t_sample_weights)
+                    pr_encoded = m.predict(X_v)
+                    pr = le.inverse_transform(pr_encoded)
+                    
+                    from sklearn.metrics import f1_score
+                    return f1_score(y_v, pr, average='weighted', zero_division=0)
+                except Exception:
+                    return 0.0
+
+
                 
             study_b = optuna.create_study(direction='maximize')
             study_b.optimize(base_obj, n_trials=7)
             best_p = study_b.best_params
             best_p.update({'objective': 'multi:softprob', 'num_class': 3, 'random_state': 42, 'n_jobs': -1})
             
-            fold_base_model = xgb.XGBClassifier(**best_p)
-            fold_base_model.fit(X_tr, y_tr, sample_weight=tr_sample_weights)
+            try:
+                fold_base_model = xgb.XGBClassifier(**best_p)
+                fold_base_model.fit(X_tr, y_tr, sample_weight=tr_sample_weights)
+            except Exception:
+                best_p_fallback = best_p.copy()
+                best_p_fallback.pop('num_class', None)
+                best_p_fallback.pop('objective', None)
+                fold_base_model = xgb.XGBClassifier(**best_p_fallback)
+                fold_base_model.fit(X_tr, y_tr)
             
             # OOF Predictions untuk training Meta-Labeling
             n_f = 3
@@ -277,14 +300,31 @@ class HybridMLPipeline:
                 y_f_tr = y_tr.iloc[f_tr_idx]
                 X_f_va = X_tr.iloc[f_va_idx]
                 
-                f_cls = np.unique(y_f_tr)
-                f_wts = compute_class_weight(class_weight='balanced', classes=f_cls, y=y_f_tr.to_numpy())
-                f_class_weights = dict(zip(f_cls, f_wts))
-                f_sample_weights = np.array([f_class_weights[val] for val in y_f_tr])
-                
-                f_model = xgb.XGBClassifier(n_estimators=40, max_depth=4, learning_rate=0.05, objective='multi:softprob', num_class=3, random_state=42)
-                f_model.fit(X_f_tr, y_f_tr, sample_weight=f_sample_weights)
-                o_preds[f_va_idx] = f_model.predict(X_f_va)
+                try:
+                    f_cls = np.unique(y_f_tr)
+                    f_wts = compute_class_weight(class_weight='balanced', classes=f_cls, y=y_f_tr.to_numpy())
+                    f_class_weights = dict(zip(f_cls, f_wts))
+                    f_sample_weights = np.array([f_class_weights[val] for val in y_f_tr])
+                    
+                    from sklearn.preprocessing import LabelEncoder
+                    le = LabelEncoder()
+                    y_f_tr_encoded = le.fit_transform(y_f_tr)
+                    
+                    f_model = xgb.XGBClassifier(n_estimators=40, max_depth=4, learning_rate=0.05, random_state=42)
+                    f_model.fit(X_f_tr, y_f_tr_encoded, sample_weight=f_sample_weights)
+                    pred_encoded = f_model.predict(X_f_va)
+                    o_preds[f_va_idx] = le.inverse_transform(pred_encoded)
+                except Exception:
+                    from sklearn.preprocessing import LabelEncoder
+                    le = LabelEncoder()
+                    y_f_tr_encoded = le.fit_transform(y_f_tr)
+                    
+                    f_model = xgb.XGBClassifier(n_estimators=40, max_depth=4, learning_rate=0.05, random_state=42)
+                    f_model.fit(X_f_tr, y_f_tr_encoded)
+                    pred_encoded = f_model.predict(X_f_va)
+                    o_preds[f_va_idx] = le.inverse_transform(pred_encoded)
+
+
                 
             active_tr_idx = np.where(o_preds != 1)[0]
             X_m_tr = X_tr.iloc[active_tr_idx]
@@ -311,23 +351,27 @@ class HybridMLPipeline:
                 X_v = X_m_tr.iloc[-val_sz:]
                 y_v = y_m_tr[-val_sz:]
                 
-                t_cls = np.unique(y_t)
-                if len(t_cls) < 2:
-                    m = xgb.XGBClassifier(**p)
-                    m.fit(X_t, y_t)
-                    pr = m.predict(X_v)
-                    from sklearn.metrics import accuracy_score
-                    return accuracy_score(y_v, pr)
+                try:
+                    t_cls = np.unique(y_t)
+                    if len(t_cls) < 2:
+                        m = xgb.XGBClassifier(**p)
+                        m.fit(X_t, y_t)
+                        pr = m.predict(X_v)
+                        from sklearn.metrics import accuracy_score
+                        return accuracy_score(y_v, pr)
+                        
+                    t_wts = compute_class_weight('balanced', classes=t_cls, y=y_t)
+                    t_class_weights = dict(zip(t_cls, t_wts))
+                    t_sample_weights = np.array([t_class_weights[val] for val in y_t])
                     
-                t_wts = compute_class_weight('balanced', classes=t_cls, y=y_t)
-                t_class_weights = dict(zip(t_cls, t_wts))
-                t_sample_weights = np.array([t_class_weights[val] for val in y_t])
-                
-                m = xgb.XGBClassifier(**p)
-                m.fit(X_t, y_t, sample_weight=t_sample_weights)
-                pr = m.predict(X_v)
-                from sklearn.metrics import f1_score
-                return f1_score(y_v, pr, average='binary', zero_division=0)
+                    m = xgb.XGBClassifier(**p)
+                    m.fit(X_t, y_t, sample_weight=t_sample_weights)
+                    pr = m.predict(X_v)
+                    from sklearn.metrics import f1_score
+                    return f1_score(y_v, pr, average='binary', zero_division=0)
+                except Exception:
+                    return 0.5
+
                 
             study_m = optuna.create_study(direction='maximize')
             study_m.optimize(meta_obj, n_trials=7)
@@ -395,13 +439,9 @@ class HybridMLPipeline:
             import matplotlib.pyplot as plt
             
             close_test = dataset.loc[X_test.index, 'close']
-            # Hapus penimpaan prob_success di sini untuk mencegah backtest leakage!
-            # Kita menggunakan array prob_success OOS murni yang dikumpulkan di line 341.
-            
-            # Sinyal boolean berdasarkan threshold manajemen risiko (Konversi ke pandas Series untuk mendukung .shift)
-            entries = pd.Series((base_test_preds == 2) & (prob_success >= 0.45), index=close_test.index)
-            short_entries = pd.Series((base_test_preds == 0) & (prob_success >= 0.60), index=close_test.index)
-
+            # Sinyal boolean berdasarkan threshold manajemen risiko (Geser 1 bar untuk anti look-ahead bias)
+            entries = pd.Series((base_test_preds == 2) & (prob_success >= 0.45), index=close_test.index).shift(1).fillna(False)
+            short_entries = pd.Series((base_test_preds == 0) & (prob_success >= 0.60), index=close_test.index).shift(1).fillna(False)
             
             # --- KELLY POSITION SIZING ---
             # Formula Kelly: f* = p - (1-p)/b
@@ -425,37 +465,50 @@ class HybridMLPipeline:
                 # Batasi maksimum allocation 10% dan minimum 0%
                 kelly_sizes[idx] = np.clip(half_kelly, 0.0, 0.10)
                 
-            # Coba jalankan simulasi Dual-Sided (Long & Short) secara terintegrasi
+            # Geser Kelly sizes 1 bar agar sinkron dengan pergeseran sinyal
+            kelly_sizes = pd.Series(kelly_sizes, index=close_test.index).shift(1).fillna(0.0).to_numpy()
+            
+            # --- BRACKET ATR TP/SL EXITS (SELARAS TRIPLE-BARRIER LABEL) ---
+            # TP = 2.0 * ATR, SL = 1.5 * ATR (Dikonversi ke % dari Close saat entry)
+            atr_test = dataset.loc[X_test.index, 'atr']
+            tp_stops = (2.0 * atr_test / close_test).fillna(0.0).to_numpy()
+            sl_stops = (1.5 * atr_test / close_test).fillna(0.0).to_numpy()
+            
+            # Coba jalankan simulasi Dual-Sided (Long & Short) secara terintegrasi dengan Bracket ATR Stops
             try:
                 portfolio = vbt.Portfolio.from_signals(
                     close=close_test,
                     entries=entries,
-                    exits=short_entries | entries.shift(40).fillna(False), # auto-exit setelah 40 bar
+                    exits=short_entries | entries.shift(40).fillna(False), # auto-exit setelah 40 bar (timeout)
                     short_entries=short_entries,
-                    short_exits=entries | short_entries.shift(40).fillna(False), # auto-exit setelah 40 bar
+                    short_exits=entries | short_entries.shift(40).fillna(False), # auto-exit setelah 40 bar (timeout)
                     size=kelly_sizes,
                     size_type="percent",
+                    tp_stop=tp_stops,
+                    sl_stop=sl_stops,
                     fees=0.0006, # 0.06% Binance spot VIP 0
                     slippage=0.0001, # 0.01% slippage
                     freq="15min",
                     init_cash=10000.0
                 )
-                print("[VBT-BACKTEST] Berhasil menjalankan simulasi Dual-Sided (Long & Short) Kuantitatif!")
+                print("[VBT-BACKTEST] Berhasil menjalankan simulasi Dual-Sided (Long & Short) dengan Bracket ATR Stops!")
             except Exception as e:
                 print(f"[VBT-BACKTEST] Gagal membuat portfolio Dual-Sided ({e}). Menggunakan fallback Long-Only secara aman...")
                 portfolio = vbt.Portfolio.from_signals(
                     close=close_test,
                     entries=entries,
-                    exits=short_entries,
+                    exits=short_entries | entries.shift(40).fillna(False),
                     size=kelly_sizes,
                     size_type="percent",
+                    tp_stop=tp_stops,
+                    sl_stop=sl_stops,
                     fees=0.0006,
                     slippage=0.0001,
                     freq="15min",
                     init_cash=10000.0
                 )
             
-            # Ekstrak Metrik
+            # Ekstrak Metrik Strategi Hibrida
             total_return = portfolio.total_return() * 100
             sharpe_ratio = portfolio.sharpe_ratio()
             sortino_ratio = portfolio.sortino_ratio()
@@ -466,11 +519,16 @@ class HybridMLPipeline:
             win_rate = portfolio.trades.win_rate() * 100 if total_trades > 0 else 0.0
             profit_factor = portfolio.trades.profit_factor() if total_trades > 0 else 0.0
             
+            # --- BUY-AND-HOLD PASIF BENCHMARK ---
+            portfolio_bh = vbt.Portfolio.from_holding(close_test, init_cash=10000.0, freq="15min")
+            bh_return = portfolio_bh.total_return() * 100
+            bh_sharpe = portfolio_bh.sharpe_ratio()
+            
             print("=====================================================")
             print("         LAPORAN BACKTEST PORTOFOLIO VECTORBT        ")
             print("=====================================================")
-            print(f" Total Return          : {total_return:+.2f}%")
-            print(f" Sharpe Ratio          : {sharpe_ratio:.4f}")
+            print(f" Total Return          : {total_return:+.2f}% vs. B&H B-mark: {bh_return:+.2f}%")
+            print(f" Sharpe Ratio          : {sharpe_ratio:.4f} vs. B&H B-mark: {bh_sharpe:.4f}")
             print(f" Sortino Ratio         : {sortino_ratio:.4f}")
             print(f" Max Drawdown          : {max_drawdown:.2f}%")
             print(f" Total Trades          : {total_trades}")
@@ -619,10 +677,13 @@ class HybridMLPipeline:
             "short_entries": short_entries if 'short_entries' in locals() else None,
             "kelly_sizes": kelly_sizes if 'kelly_sizes' in locals() else None,
             "prob_success": prob_success if 'prob_success' in locals() else None,
+            "tp_stops": tp_stops if 'tp_stops' in locals() else None,
+            "sl_stops": sl_stops if 'sl_stops' in locals() else None,
             "latest_idx": latest_idx if 'latest_idx' in locals() else None,
             "latest_action": action if 'action' in locals() else None,
             "latest_prob_success": latest_prob_success if 'latest_prob_success' in locals() else None
         }
+
 
 
 

@@ -51,7 +51,10 @@ def run_multi_asset_portfolio():
     if len(results) < 2:
         print("[ERROR] Data aset yang berhasil dimuat kurang dari 2. Alokasi portofolio dibatalkan.")
         return
-        
+
+    # Hanya proses aset yang benar-benar berhasil dimuat (cegah KeyError saat ada aset di-skip)
+    active = [s for s in symbols if s in results]
+
     print("\n" + "=" * 50)
     print("         PERHITUNGAN BOBOT ALOKASI RISK PARITY")
     print("=" * 50)
@@ -61,7 +64,7 @@ def run_multi_asset_portfolio():
     sum_inv_vols = sum(inv_vols.values())
     weights = {sym: inv_vol / sum_inv_vols for sym, inv_vol in inv_vols.items()}
     
-    for sym in symbols:
+    for sym in active:
         print(f" - {sym:<10} : Vol={volatilities[sym]*100:.4f}% | Bobot Alokasi={weights[sym]*100:.2f}%")
     print("=" * 50 + "\n")
     
@@ -84,19 +87,25 @@ def run_multi_asset_portfolio():
     entries_df = pd.DataFrame(index=common_index)
     short_entries_df = pd.DataFrame(index=common_index)
     sizes_df = pd.DataFrame(index=common_index)
+    tp_stops_df = pd.DataFrame(index=common_index)
+    sl_stops_df = pd.DataFrame(index=common_index)
     
-    for sym in symbols:
+    for sym in active:
         res = results[sym]
         close_df[sym] = res["close_test"].loc[common_index]
         entries_df[sym] = res["entries"].loc[common_index]
         short_entries_df[sym] = res["short_entries"].loc[common_index]
         
-        # Lot sizing gabungan: Bobot Risk Parity dikalikan lot sizing Kelly internal
-        # Ini menyetarakan resiko Kelly global antar instrumen
+        # Lot sizing = Kelly fraction internal per-aset.
+        # Bobot Risk Parity diterapkan SATU KALI saja, lewat alokasi init_cash di bawah,
+        # bukan dikalikan lagi ke size (mencegah double-counting tilt).
         raw_sizes = res["kelly_sizes"]
-        # Ubah raw_sizes (numpy array) menjadi pandas Series agar aman dilokalisasi indeksnya
         sizes_series = pd.Series(raw_sizes, index=res["close_test"].index).loc[common_index]
-        sizes_df[sym] = sizes_series * weights[sym]
+        sizes_df[sym] = sizes_series
+        
+        # Penyelarasan Bracket Exits ATR stops untuk masing-masing aset
+        tp_stops_df[sym] = pd.Series(res["tp_stops"], index=res["close_test"].index).loc[common_index]
+        sl_stops_df[sym] = pd.Series(res["sl_stops"], index=res["close_test"].index).loc[common_index]
         
     # 4. Eksekusi Backtest Portofolio Gabungan Terpadu via VectorBT
     print("[MULTI-ASSET] Memulai Simulasi Backtesting Portofolio Multi-Asset di VectorBT...")
@@ -106,20 +115,43 @@ def run_multi_asset_portfolio():
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
         
-        # Alokasikan modal awal $10,000 proporsional berdasarkan bobot Risk Parity
-        init_cash_list = [10000.0 * weights[sym] for sym in symbols]
+        # Alokasikan modal awal $10,000 proporsional berdasarkan bobot Risk Parity.
+        # Urutan HARUS mengikuti kolom close_df agar selaras dengan vectorbt.
+        init_cash_list = [10000.0 * weights[sym] for sym in close_df.columns]
         
-        portfolio = vbt.Portfolio.from_signals(
-            close=close_df,
-            entries=entries_df,
-            exits=short_entries_df,
-            size=sizes_df,
-            size_type="percent",
-            fees=0.0006, # 0.06% spot fee
-            slippage=0.0001, # 0.01% slippage
-            freq="15min",
-            init_cash=init_cash_list
-        )
+        # Coba jalankan simulasi Dual-Sided (Long & Short) secara terintegrasi dengan Bracket ATR Stops
+        try:
+            portfolio = vbt.Portfolio.from_signals(
+                close=close_df,
+                entries=entries_df,
+                exits=short_entries_df | entries_df.shift(40).fillna(False),       # auto-exit 40 bar
+                short_entries=short_entries_df,
+                short_exits=entries_df | short_entries_df.shift(40).fillna(False),  # auto-exit 40 bar
+                size=sizes_df,
+                size_type="percent",
+                tp_stop=tp_stops_df,
+                sl_stop=sl_stops_df,
+                fees=0.0006, # 0.06% spot fee
+                slippage=0.0001, # 0.01% slippage
+                freq="15min",
+                init_cash=init_cash_list
+            )
+            print("[MULTI-ASSET] Berhasil menjalankan simulasi Dual-Sided (Long & Short) Portofolio!")
+        except Exception as e:
+            print(f"[MULTI-ASSET] Gagal membuat portfolio Dual-Sided ({e}). Menggunakan fallback Long-Only secara aman...")
+            portfolio = vbt.Portfolio.from_signals(
+                close=close_df,
+                entries=entries_df,
+                exits=short_entries_df | entries_df.shift(40).fillna(False),
+                size=sizes_df,
+                size_type="percent",
+                tp_stop=tp_stops_df,
+                sl_stop=sl_stops_df,
+                fees=0.0006,
+                slippage=0.0001,
+                freq="15min",
+                init_cash=init_cash_list
+            )
         
         # Hitung Equity Curve masing-masing aset dan portofolio gabungan total
         individual_equities = portfolio.value()
@@ -134,33 +166,54 @@ def run_multi_asset_portfolio():
         drawdowns = (total_portfolio_equity - rolling_max) / rolling_max
         max_drawdown = drawdowns.min() * 100
         
+        # --- BUY-AND-HOLD PASIF BENCHMARK PORTFOLIO ---
+        portfolio_bh = vbt.Portfolio.from_holding(
+            close=close_df,
+            init_cash=init_cash_list,
+            fees=0.0006,
+            slippage=0.0001,
+            freq="15min"
+        )
+        total_bh_equity = portfolio_bh.value().sum(axis=1)
+        bh_final_value = total_bh_equity.iloc[-1]
+        bh_return = ((bh_final_value - 10000.0) / 10000.0) * 100
+        
+        # Drawdown B&H
+        bh_rolling_max = total_bh_equity.cummax()
+        bh_drawdowns = (total_bh_equity - bh_rolling_max) / bh_rolling_max
+        bh_max_drawdown = bh_drawdowns.min() * 100
+        
         # Cetak Laporan Portofolio
         print("=" * 60)
         print("     LAPORAN KINERJA GABUNGAN PORTOFOLIO MULTI-ASSET     ")
         print("=" * 60)
-        print(f" Simbol Terbaca        : {', '.join(symbols)}")
+        print(f" Simbol Terbaca        : {', '.join(active)}")
         print(f" Modal Awal Global     : $10,000.00")
-        print(f" Nilai Akhir Portofolio: ${final_value:,.2f}")
-        print(f" Total Return          : {total_return:+.2f}%")
-        print(f" Max Drawdown          : {max_drawdown:.2f}%")
+        print(f" Nilai Akhir Portofolio: ${final_value:,.2f} vs. B&H B-mark: ${bh_final_value:,.2f}")
+        print(f" Total Return          : {total_return:+.2f}% vs. B&H B-mark: {bh_return:+.2f}%")
+        print(f" Max Drawdown          : {max_drawdown:.2f}% vs. B&H B-mark: {bh_max_drawdown:.2f}%")
         print("=" * 60)
         
         # 5. Gambarkan Grafik Perbandingan Premium & Simpan
         plt.figure(figsize=(12, 6))
         
         # Plot perkembangan ekuitas individu (diskala ke $10,000 agar mudah dibandingkan)
-        for sym in symbols:
-            norm_equity = (individual_equities[sym] / init_cash_list[symbols.index(sym)]) * 10000.0
-            plt.plot(norm_equity, label=f"{sym} (Risk-Scaled Baseline)", alpha=0.6, linestyle="--")
+        for sym in active:
+            norm_equity = (individual_equities[sym] / (10000.0 * weights[sym])) * 10000.0
+            plt.plot(norm_equity, label=f"{sym} (Risk-Scaled Baseline)", alpha=0.4, linestyle="--")
             
-        # Plot ekuitas portofolio gabungan total
-        plt.plot(total_portfolio_equity, label="PORTFOLIO TOTAL (Risk Parity)", color="#00ffcc", linewidth=2.5)
+        # Plot ekuitas portofolio gabungan total (Risk Parity Strategy)
+        plt.plot(total_portfolio_equity, label="PORTFOLIO TOTAL (Risk Parity Strategy)", color="#00ffcc", linewidth=2.5)
         
-        plt.title("Perbandingan Perkembangan Ekuitas Individu vs. Portofolio Risk Parity Multi-Asset", fontsize=14, color="white", weight="bold")
+        # Plot ekuitas portofolio benchmark pasif Buy-and-Hold
+        plt.plot(total_bh_equity, label="PORTFOLIO B-MARK (Passive Buy-and-Hold)", color="#ff5555", linewidth=1.8, linestyle="-.")
+        
+        plt.title("Perbandingan Perkembangan Ekuitas: Risk Parity vs. Buy-and-Hold Pasif", fontsize=14, color="white", weight="bold")
         plt.xlabel("Waktu", fontsize=11, color="white")
         plt.ylabel("Ekuitas Saldo (USD)", fontsize=11, color="white")
         plt.grid(True, linestyle="--", alpha=0.3)
         plt.legend(facecolor="#1e1e1e", edgecolor="#00ffcc", labelcolor="white")
+
         
         # Estetika Dark Mode Premium
         fig = plt.gcf()
@@ -186,7 +239,7 @@ def run_multi_asset_portfolio():
     print("\n" + "=" * 50)
     print("      STATUS SINYAL LIVE TERAKHIR (DENGAN LLM GATE)")
     print("=" * 50)
-    for sym in symbols:
+    for sym in active:
         if sym in results:
             res = results[sym]
             print(f" - {sym:<10} pada {res['latest_idx']} : ML Sinyal={res['latest_action']:<5} | Prob Sukses={res['latest_prob_success']*100:.2f}%")
