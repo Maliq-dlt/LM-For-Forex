@@ -54,22 +54,18 @@ def build_hybrid_dataset(
         chronos_feats = forecaster.extract_features(df_low_tf, prediction_length=12, context_length=100)
         feats_low = feats_low.join(chronos_feats)
         
-        # Integrasikan ramalan Chronos dengan level OB/Swing SMC (Kombinasi Maksimal)
-        # Cek apakah kuantil 90% Chronos menembus Swing High terkonfirmasi terakhir
+        # Gunakan kuantil ASLI dari model Chronos (bukan aproksimasi Z-score)
+        # chronos_q90_end dan chronos_q10_end adalah rasio harga (q/close)
         close_low = df_low_tf['close'].to_numpy()
         run_sh_low = close_low * (1.0 + feats_low['dist_to_swing_high'].to_numpy())
         run_sl_low = close_low * (1.0 - feats_low['dist_to_swing_low'].to_numpy())
         
-        # Ambil median forecast dan std deviasi
-        trend_est = feats_low['chronos_trend'].to_numpy()
-        vol_est = feats_low['chronos_volatility'].to_numpy()
+        # Proyeksi harga absolut dari kuantil asli Chronos
+        actual_q90 = close_low * feats_low['chronos_q90_end'].to_numpy()
+        actual_q10 = close_low * feats_low['chronos_q10_end'].to_numpy()
         
-        # Proyeksikan batas kuantil 90% (atas) dan 10% (bawah) ke depan secara aproksimasi
-        approx_q90 = close_low * np.exp(trend_est + 1.28 * vol_est)
-        approx_q10 = close_low * np.exp(trend_est - 1.28 * vol_est)
-        
-        feats_low['chronos_breach_sh'] = (approx_q90 > run_sh_low).astype(int)
-        feats_low['chronos_breach_sl'] = (approx_q10 < run_sl_low).astype(int)
+        feats_low['chronos_breach_sh'] = (actual_q90 > run_sh_low).astype(int)
+        feats_low['chronos_breach_sl'] = (actual_q10 < run_sl_low).astype(int)
         print("[4] Kombinasi Fitur Kuantitatif Chronos & SMC Sukses!")
     else:
         print("[4] Amazon Chronos dilewati.")

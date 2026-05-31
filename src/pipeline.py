@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 import warnings
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, KFold
 from sklearn.metrics import classification_report, accuracy_score
 from sklearn.utils.class_weight import compute_class_weight
 
@@ -133,6 +133,7 @@ class HybridMLPipeline:
             'upper_wick_ratio', 'lower_wick_ratio', 'bull_fvg', 'bear_fvg',
             'premium_discount_pct', 'in_discount', 'in_premium',
             'chronos_trend', 'chronos_volatility', 'chronos_skewness',
+            'chronos_q90_end', 'chronos_q10_end',
             'chronos_breach_sh', 'chronos_breach_sl',
             'htf_structure', 'htf_premium_discount_pct', 'htf_in_discount', 'htf_in_premium'
         ]
@@ -187,25 +188,46 @@ class HybridMLPipeline:
         print("\nLaporan Performa Model ML Primer:")
         print(classification_report(y_test, y_pred, target_names=['SELL', 'HOLD', 'BUY'], zero_division=0))
         
-        # 8. Pipeline Meta-Labeling (Model ML Sekunder)
-        print("\n[PIPELINE] Memulai penyusunan Meta-Labeling Dataset...")
-        base_train_preds = self.base_model.predict(X_train)
+        # 8. Pipeline Meta-Labeling dengan K-Fold Out-of-Fold (OOF) Predictions
+        # CRITICAL FIX: Menggunakan OOF predictions untuk menghindari in-sample bias.
+        print("\n[PIPELINE] Memulai penyusunan Meta-Labeling Dataset (K-Fold OOF)...")
+        
+        n_folds = 5
+        oof_preds = np.full(len(X_train), -1, dtype=int)
+        kf = KFold(n_splits=n_folds, shuffle=False)
+        
+        print(f"[META-OOF] Menghasilkan Out-of-Fold predictions ({n_folds} folds)...")
+        for fold_idx, (fold_train_idx, fold_val_idx) in enumerate(kf.split(X_train)):
+            X_fold_train = X_train.iloc[fold_train_idx]
+            y_fold_train = y_train.iloc[fold_train_idx]
+            X_fold_val = X_train.iloc[fold_val_idx]
+            
+            fold_classes = np.unique(y_fold_train)
+            fold_wts = compute_class_weight(class_weight='balanced', classes=fold_classes, y=y_fold_train.to_numpy())
+            fold_class_weights = dict(zip(fold_classes, fold_wts))
+            fold_sample_weights = np.array([fold_class_weights[val] for val in y_fold_train])
+            
+            fold_model = xgb.XGBClassifier(
+                n_estimators=50, max_depth=4, learning_rate=0.05,
+                objective='multi:softprob', num_class=3, random_state=42
+            )
+            fold_model.fit(X_fold_train, y_fold_train, sample_weight=fold_sample_weights)
+            oof_preds[fold_val_idx] = fold_model.predict(X_fold_val)
+        
         base_test_preds = self.base_model.predict(X_test)
         
-        # Meta-label = 1 jika prediksi model primer cocok dengan label asli dan merupakan aksi aktif (BUY/SELL)
-        meta_y_train = np.where((base_train_preds == y_train) & (base_train_preds != 1), 1, 0)
+        meta_y_train = np.where((oof_preds == y_train) & (oof_preds != 1), 1, 0)
         meta_y_test = np.where((base_test_preds == y_test) & (base_test_preds != 1), 1, 0)
         
-        print("Jumlah Sinyal Sukses di Data Latihan  (Meta-Label=1):", np.sum(meta_y_train))
-        print("Jumlah Sinyal Gagal/Hold di Data Latihan (Meta-Label=0):", len(meta_y_train) - np.sum(meta_y_train))
+        print(f"Jumlah Sinyal Sukses OOF di Data Latihan  (Meta-Label=1): {np.sum(meta_y_train)}")
+        print(f"Jumlah Sinyal Gagal/Hold OOF di Data Latihan (Meta-Label=0): {len(meta_y_train) - np.sum(meta_y_train)}")
         
-        # Model ML Sekunder menggunakan class weighting untuk menyeimbangkan kelas biner sukses/gagal
         meta_classes = np.unique(meta_y_train)
         meta_wts = compute_class_weight(class_weight='balanced', classes=meta_classes, y=meta_y_train)
         meta_class_weights = dict(zip(meta_classes, meta_wts))
         meta_sample_weights = np.array([meta_class_weights[val] for val in meta_y_train])
         
-        print("\n[PIPELINE] Melatih Model ML Sekunder (Meta-Labeling XGBoost)...")
+        print("\n[PIPELINE] Melatih Model ML Sekunder (Meta-Labeling XGBoost) pada OOF labels...")
         self.meta_model = xgb.XGBClassifier(
             n_estimators=30,
             max_depth=3,
@@ -255,7 +277,7 @@ class HybridMLPipeline:
                 "action": action,
                 "symbol": self.symbol,
                 "timeframe": "15m",
-                "htf_structure": "Bullish Trend" if latest_features['htf_structure'] > 0 else "Bearish Trend",
+                "htf_structure": "Bullish Trend" if latest_features['htf_structure'] > 0 else ("Sideways / Neutral" if latest_features['htf_structure'] == 0 else "Bearish Trend"),
                 "dist_to_ob": f"{latest_features['dist_to_swing_high']*100:.2f}" if action == "SELL" else f"{latest_features['dist_to_swing_low']*100:.2f}",
                 "chronos_direction": "Bullish Expansion" if latest_features['chronos_trend'] > 0 else "Bearish Contraction"
             }

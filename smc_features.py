@@ -79,6 +79,7 @@ def build_features(df: pd.DataFrame, k: int = 2) -> pd.DataFrame:
             else:
                 bos_up[i] = True         # kelanjutan tren
             trend = 1
+            if not np.isnan(brk_sl): last_sl = brk_sl
             brk_sh = np.nan
         if not np.isnan(brk_sl) and close[i] < brk_sl:
             if trend >= 0:
@@ -86,6 +87,7 @@ def build_features(df: pd.DataFrame, k: int = 2) -> pd.DataFrame:
             else:
                 bos_down[i] = True
             trend = -1
+            if not np.isnan(brk_sh): last_sh = brk_sh
             brk_sl = np.nan
 
         structure[i] = trend

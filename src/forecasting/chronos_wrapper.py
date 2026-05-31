@@ -103,10 +103,11 @@ class ChronosForecaster:
             "samples": paths
         }
 
-    def extract_features(self, df: pd.DataFrame, prediction_length: int = 12, context_length: int = 100) -> pd.DataFrame:
+    def extract_features(self, df: pd.DataFrame, prediction_length: int = 12, context_length: int = 100, step: int = 4) -> pd.DataFrame:
         """
-        Mengekstrak 5 Fitur Kuantitatif dari ramalan Chronos tanpa look-ahead bias.
-        Setiap baris i hanya boleh melihat data Close dari baris <= i.
+        Mengekstrak Fitur Kuantitatif dari ramalan Chronos tanpa look-ahead bias.
+        Menggunakan step inference (setiap `step` bar) untuk efisiensi CPU.
+        Fitur dihitung dari kuantil ASLI model Chronos, bukan aproksimasi Z-score.
         """
         n = len(df)
         close = df['close'].to_numpy()
@@ -114,18 +115,19 @@ class ChronosForecaster:
         chronos_trend = np.zeros(n)
         chronos_volatility = np.zeros(n)
         chronos_skewness = np.zeros(n)
+        chronos_q90_end = np.zeros(n)
+        chronos_q10_end = np.zeros(n)
         
-        print(f"[CHRONOS] Mengekstrak fitur ramalan probabilistik untuk {n} baris...")
+        print(f"[CHRONOS] Mengekstrak fitur probabilistik untuk {n} baris (step={step})...")
         
-        # Untuk efisiensi komputasi di CPU, kita jalankan rolling window 
-        # Kita lewati bar awal yang tidak cukup context_length
+        last_fc = None
         for i in range(context_length, n):
-            # Batasi context historis
-            context = close[i - context_length + 1 : i + 1]
+            # Hanya jalankan inferensi model setiap `step` bar untuk efisiensi
+            if (i - context_length) % step == 0 or last_fc is None:
+                context = close[i - context_length + 1 : i + 1]
+                last_fc = self.predict_probabilistic(context, prediction_length=prediction_length)
             
-            # Prediksi probabilistik ke depan
-            fc = self.predict_probabilistic(context, prediction_length=prediction_length)
-            
+            fc = last_fc
             q10 = fc["q10"]
             q50 = fc["q50"]
             q90 = fc["q90"]
@@ -133,22 +135,27 @@ class ChronosForecaster:
             # 1. Trend: Log-return dari harga sekarang ke median prediksi di akhir horizon
             chronos_trend[i] = np.log(q50[-1] / close[i])
             
-            # 2. Volatility: Standar deviasi dari seluruh prediksi median
-            chronos_volatility[i] = np.std(q50) / close[i]
+            # 2. Volatility: Lebar interval prediksi ASLI (q90 - q10) dinormalisasi
+            #    Ini mengukur ketidakpastian (uncertainty) distribusi harga, BUKAN waviness median
+            chronos_volatility[i] = (q90[-1] - q10[-1]) / close[i]
             
-            # 3. Skewness: Bias arah (jarak q90-q50 dibanding q50-q10)
-            # Nilai positif berarti bias ke atas (bullish bias), negatif ke bawah (bearish bias)
+            # 3. Skewness: Bias arah distribusi probabilistik
             range_up = q90[-1] - q50[-1]
             range_down = q50[-1] - q10[-1]
             denom = range_up + range_down
             chronos_skewness[i] = (range_up - range_down) / (denom + 1e-12)
             
+            # 4 & 5. Endpoint kuantil asli (dinormalisasi) untuk breach detection di alignment.py
+            chronos_q90_end[i] = q90[-1] / close[i]
+            chronos_q10_end[i] = q10[-1] / close[i]
+            
         out = pd.DataFrame(index=df.index)
         out["chronos_trend"] = chronos_trend
         out["chronos_volatility"] = chronos_volatility
         out["chronos_skewness"] = chronos_skewness
+        out["chronos_q90_end"] = chronos_q90_end
+        out["chronos_q10_end"] = chronos_q10_end
         
-        # Untuk Fills data awal yang kosong dengan 0/median
         out = out.fillna(0.0)
         return out
 
