@@ -68,7 +68,7 @@ class HybridMLPipeline:
             print("#" + " " * 68 + "#")
             print("#" * 70 + "\n")
             
-            df_15m = _synthetic_ohlcv(n=1000, seed=42)
+            df_15m = _synthetic_ohlcv(n=1000, seed=42, symbol=self.symbol)
             df_15m.index = pd.date_range("2026-01-01", periods=1000, freq="15min")
             
         # 2. High Timeframe (1D)
@@ -80,8 +80,9 @@ class HybridMLPipeline:
             if strict_mode:
                 raise ValueError(f"[ERROR CRITICAL] Strict Mode aktif dan CCXT gagal menarik data 1D: {e}")
             
-            df_1d = _synthetic_ohlcv(n=100, seed=24)
+            df_1d = _synthetic_ohlcv(n=100, seed=24, symbol=self.symbol)
             df_1d.index = pd.date_range("2025-11-01", periods=100, freq="1D")
+
             
         return df_15m, df_1d
 
@@ -610,6 +611,19 @@ class HybridMLPipeline:
             else:
                 print(f"\n[-] Sinyal {action} DIBATALKAN: P={latest_prob_success*100:.1f}% < threshold {threshold*100:.0f}% untuk {action} (impas={breakeven_wr*100:.1f}%).")
                 print(f"    Ekspektasi meskipun positif ({expectancy_ratio:+.3f}) belum cukup aman.")
+                
+        # Return hasil untuk kepentingan orkestrator multi-asset
+        return {
+            "close_test": close_test if 'close_test' in locals() else None,
+            "entries": entries if 'entries' in locals() else None,
+            "short_entries": short_entries if 'short_entries' in locals() else None,
+            "kelly_sizes": kelly_sizes if 'kelly_sizes' in locals() else None,
+            "prob_success": prob_success if 'prob_success' in locals() else None,
+            "latest_idx": latest_idx if 'latest_idx' in locals() else None,
+            "latest_action": action if 'action' in locals() else None,
+            "latest_prob_success": latest_prob_success if 'latest_prob_success' in locals() else None
+        }
+
 
 
 if __name__ == "__main__":

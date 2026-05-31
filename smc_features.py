@@ -431,20 +431,36 @@ def load_ohlcv_ccxt(symbol="BTC/USDT", timeframe="15m", limit=1500, exchange_id=
     return df.set_index("ts")
 
 
-def _synthetic_ohlcv(n=600, seed=0):
-    """Buat OHLCV sintetis (random walk) untuk menguji logika tanpa internet."""
+def _synthetic_ohlcv(n=600, seed=0, symbol="BTC/USDT"):
+    """Buat OHLCV sintetis (random walk) dengan parameter realistis per instrumen."""
     rng = np.random.default_rng(seed)
-    ret = rng.normal(0, 0.003, n)
-    close = 30000 * np.exp(np.cumsum(ret))
+    
+    # Atur volatilitas, harga awal, dan wick khas tiap instrumen
+    if "EUR" in symbol:
+        vol = 0.0005
+        init_price = 1.09
+        wick_scale = 0.0004
+    elif "XAU" in symbol or "GOLD" in symbol:
+        vol = 0.0015
+        init_price = 2000.0
+        wick_scale = 0.0012
+    else: # Default Kripto (BTC)
+        vol = 0.003
+        init_price = 30000.0
+        wick_scale = 0.0025
+        
+    ret = rng.normal(0, vol, n)
+    close = init_price * np.exp(np.cumsum(ret))
     open_ = np.empty(n)
     open_[0] = close[0]
     open_[1:] = close[:-1]
-    wick = np.abs(rng.normal(0, 0.0025, n))
+    wick = np.abs(rng.normal(0, wick_scale, n))
     high = np.maximum(open_, close) * (1 + wick)
     low = np.minimum(open_, close) * (1 - wick)
     idx = pd.date_range("2026-01-01", periods=n, freq="15min")
     return pd.DataFrame({"open": open_, "high": high, "low": low, "close": close},
                         index=idx)
+
 
 
 if __name__ == "__main__":
