@@ -216,18 +216,39 @@ class HybridMLPipeline:
         
         base_test_preds = self.base_model.predict(X_test)
         
-        meta_y_train = np.where((oof_preds == y_train) & (oof_preds != 1), 1, 0)
-        meta_y_test = np.where((base_test_preds == y_test) & (base_test_preds != 1), 1, 0)
+        # LÓPEZ DE PRADO FIX: Meta-Model HANYA boleh dilatih pada subset data
+        # di mana model primer mengeluarkan sinyal AKTIF (BUY/SELL, bukan HOLD).
+        # Memasukkan baris HOLD akan "mencemari" meta-model karena ia bingung
+        # membedakan "sinyal gagal" vs "tidak ada sinyal".
         
-        print(f"Jumlah Sinyal Sukses OOF di Data Latihan  (Meta-Label=1): {np.sum(meta_y_train)}")
-        print(f"Jumlah Sinyal Gagal/Hold OOF di Data Latihan (Meta-Label=0): {len(meta_y_train) - np.sum(meta_y_train)}")
+        # Filter training set: hanya ambil indeks dengan sinyal aktif (OOF pred != HOLD)
+        active_idx_train = np.where(oof_preds != 1)[0]
+        X_meta_train = X_train.iloc[active_idx_train]
+        # Meta-label = 1 jika arah prediksi OOF benar, 0 jika salah
+        meta_y_train = np.where(
+            oof_preds[active_idx_train] == y_train.iloc[active_idx_train], 1, 0
+        )
         
+        # Filter test set: hanya evaluasi pada sinyal aktif dari base model
+        active_idx_test = np.where(base_test_preds != 1)[0]
+        X_meta_test = X_test.iloc[active_idx_test]
+        meta_y_test = np.where(
+            base_test_preds[active_idx_test] == y_test.iloc[active_idx_test], 1, 0
+        )
+        
+        print(f"Sinyal Aktif OOF di Training : {len(active_idx_train)} dari {len(X_train)} baris")
+        print(f"Sinyal Sukses (Meta-Label=1) : {np.sum(meta_y_train)}")
+        print(f"Sinyal Gagal  (Meta-Label=0) : {len(meta_y_train) - np.sum(meta_y_train)}")
+        
+        # Class weighting pada dataset meta yang sudah difilter
         meta_classes = np.unique(meta_y_train)
+        if len(meta_classes) < 2:
+            warnings.warn("[META] Hanya 1 kelas meta ditemukan. Meta-model mungkin tidak informatif.")
         meta_wts = compute_class_weight(class_weight='balanced', classes=meta_classes, y=meta_y_train)
         meta_class_weights = dict(zip(meta_classes, meta_wts))
         meta_sample_weights = np.array([meta_class_weights[val] for val in meta_y_train])
         
-        print("\n[PIPELINE] Melatih Model ML Sekunder (Meta-Labeling XGBoost) pada OOF labels...")
+        print("\n[PIPELINE] Melatih Meta-Model HANYA pada sinyal aktif (López de Prado compliant)...")
         self.meta_model = xgb.XGBClassifier(
             n_estimators=30,
             max_depth=3,
@@ -235,12 +256,15 @@ class HybridMLPipeline:
             objective='binary:logistic',
             random_state=42
         )
-        self.meta_model.fit(X_train, meta_y_train, sample_weight=meta_sample_weights)
+        self.meta_model.fit(X_meta_train, meta_y_train, sample_weight=meta_sample_weights)
         
-        # Evaluasi Model Sekunder
-        meta_preds = self.meta_model.predict(X_test)
-        print("\nLaporan Performa Model Meta-Labeling:")
-        print(classification_report(meta_y_test, meta_preds, target_names=['FAILED/HOLD', 'SUCCESS_CONFIRMED'], zero_division=0))
+        # Evaluasi Model Sekunder (hanya pada sinyal aktif di test set)
+        if len(X_meta_test) > 0:
+            meta_preds = self.meta_model.predict(X_meta_test)
+            print("\nLaporan Performa Model Meta-Labeling (sinyal aktif saja):")
+            print(classification_report(meta_y_test, meta_preds, target_names=['SIGNAL_FAILED', 'SIGNAL_SUCCESS'], zero_division=0))
+        else:
+            print("\n[INFO] Tidak ada sinyal aktif di test set untuk evaluasi meta-model.")
         
         # 9. Integrasi LLM Reasoning Gatekeeper Terisolasi (Bebas Leakage)
         if backtest_mode:
@@ -263,13 +287,32 @@ class HybridMLPipeline:
         print(f"- Sinyal Arah ML Primer : {action}")
         print(f"- Probabilitas Sukses Meta-ML: {latest_prob_success * 100:.2f}%")
         
-        # CRITICAL QUANT FIX: Treshold dinaikkan dari 40% menjadi 55%
-        # Win-rate impas = 1.5 / (2 + 1.5) = 42.9%. Threshold 55% menjamin ekspektasi profit yang positif!
-        expectancy_ratio = latest_prob_success * 2.0 - (1.0 - latest_prob_success) * 1.5
-        print(f"- Estimasi Ekspektasi Matematika: {expectancy_ratio:.3f} ATR per trade")
+        # ASYMMETRIC R:R FIX: Ekspektasi BERBEDA untuk BUY vs SELL karena Triple-Barrier
+        # memiliki rasio Upper(2.0 ATR)/Lower(1.5 ATR) yang ASIMETRIS.
+        # - BUY: TP = Upper = 2.0 ATR, SL = Lower = 1.5 ATR → R:R = 2.0/1.5 = 1.33x
+        #   Win-rate impas BUY = 1.5 / (2.0 + 1.5) = 42.9%
+        # - SELL: TP = Lower = 1.5 ATR, SL = Upper = 2.0 ATR → R:R = 1.5/2.0 = 0.75x
+        #   Win-rate impas SELL = 2.0 / (1.5 + 2.0) = 57.1%
+        if action == "BUY":
+            reward_atr, risk_atr = 2.0, 1.5
+            threshold = 0.45  # Floor aman di atas impas 42.9%
+        elif action == "SELL":
+            reward_atr, risk_atr = 1.5, 2.0
+            threshold = 0.60  # Floor aman di atas impas 57.1%
+        else:
+            reward_atr, risk_atr = 0.0, 0.0
+            threshold = 1.0  # HOLD tidak pernah lolos
         
-        if action != "HOLD" and latest_prob_success > 0.55:
-            print(f"\n[!] Sinyal Kuantitatif Lolos Meta-ML (Keyakinan {latest_prob_success*100:.1f}% > 55%).")
+        expectancy_ratio = (latest_prob_success * reward_atr) - ((1.0 - latest_prob_success) * risk_atr)
+        breakeven_wr = risk_atr / (reward_atr + risk_atr) if (reward_atr + risk_atr) > 0 else 0
+        print(f"- Arah Sinyal        : {action}")
+        print(f"- Reward/Risk (ATR)  : {reward_atr}/{risk_atr}")
+        print(f"- Win-Rate Impas     : {breakeven_wr*100:.1f}%")
+        print(f"- Threshold Minimum  : {threshold*100:.1f}%")
+        print(f"- Ekspektasi per Trade: {expectancy_ratio:+.3f} ATR")
+        
+        if action != "HOLD" and latest_prob_success > threshold and expectancy_ratio > 0:
+            print(f"\n[!] Sinyal {action} Lolos Gate (P={latest_prob_success*100:.1f}% > {threshold*100:.0f}%, E[R]={expectancy_ratio:+.3f} ATR).")
             print("Mengirim konteks point-in-time ke LLM Reasoning Gate untuk validasi sentimen...")
             
             gatekeeper = MarketLLMReasoningGate()
@@ -298,8 +341,11 @@ class HybridMLPipeline:
         else:
             if action == "HOLD":
                 print("\n[-] Sinyal dibatalkan karena model menyarankan HOLD.")
+            elif expectancy_ratio <= 0:
+                print(f"\n[-] Sinyal {action} DIBATALKAN: Ekspektasi negatif ({expectancy_ratio:+.3f} ATR) pada P={latest_prob_success*100:.1f}%.")
             else:
-                print(f"\n[-] Sinyal {action} DIBATALKAN karena keyakinan Meta-ML ({latest_prob_success*100:.2f}%) berada di bawah threshold profitabel 55%.")
+                print(f"\n[-] Sinyal {action} DIBATALKAN: P={latest_prob_success*100:.1f}% < threshold {threshold*100:.0f}% untuk {action} (impas={breakeven_wr*100:.1f}%).")
+                print(f"    Ekspektasi meskipun positif ({expectancy_ratio:+.3f}) belum cukup aman.")
 
 
 if __name__ == "__main__":

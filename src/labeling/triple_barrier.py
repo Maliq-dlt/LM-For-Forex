@@ -72,13 +72,25 @@ def apply_triple_barrier_labeling(df: pd.DataFrame, tp_mult: float = 2.0, sl_mul
         for step in range(1, timeout_bars + 1):
             idx = i + step
             
-            # 1. Cek apakah menyentuh SL terlebih dahulu
-            if low[idx] <= sl_level:
+            # INTRA-BAR AMBIGUITY FIX:
+            # Dengan data OHLC, kita tidak tahu urutan intra-bar.
+            # Jika kedua barrier tersentuh di bar yang sama (volatilitas ekstrem),
+            # kita TIDAK bisa menentukan mana yang kena duluan.
+            # Solusi: label = 0 (ambiguous/netral) jika kedua barrier tersentuh,
+            # agar dataset tidak bias ke salah satu arah.
+            hit_sl = low[idx] <= sl_level
+            hit_tp = high[idx] >= tp_level
+            
+            if hit_sl and hit_tp:
+                # Kedua barrier tersentuh di bar yang sama — ambiguitas OHLC
+                hit = 0
+                hit_type = "ambiguous_both"
+                break
+            elif hit_sl:
                 hit = -1
                 hit_type = "sl"
                 break
-            # 2. Cek apakah menyentuh TP terlebih dahulu
-            elif high[idx] >= tp_level:
+            elif hit_tp:
                 hit = 1
                 hit_type = "tp"
                 break
