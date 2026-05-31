@@ -1,0 +1,9 @@
+chronos-forecasting>=2.2
+torch
+transformers
+accelerate
+ccxt
+pandas
+numpy
+xgboost
+scikit-learn
