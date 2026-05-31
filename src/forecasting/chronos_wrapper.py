@@ -123,6 +123,7 @@ class ChronosForecaster:
         last_fc = None
         for i in range(context_length, n):
             # Hanya jalankan inferensi model setiap `step` bar untuk efisiensi
+            anchor_idx = i - (i - context_length) % step
             if (i - context_length) % step == 0 or last_fc is None:
                 context = close[i - context_length + 1 : i + 1]
                 last_fc = self.predict_probabilistic(context, prediction_length=prediction_length)
@@ -132,12 +133,14 @@ class ChronosForecaster:
             q50 = fc["q50"]
             q90 = fc["q90"]
             
-            # 1. Trend: Log-return dari harga sekarang ke median prediksi di akhir horizon
-            chronos_trend[i] = np.log(q50[-1] / close[i])
+            # Ambil harga Close pada saat ramalan dibuat (anchor bar)
+            close_anchor = close[anchor_idx]
+            
+            # 1. Trend: Log-return dari harga anchor ke median prediksi di akhir horizon
+            chronos_trend[i] = np.log(q50[-1] / close_anchor)
             
             # 2. Volatility: Lebar interval prediksi ASLI (q90 - q10) dinormalisasi
-            #    Ini mengukur ketidakpastian (uncertainty) distribusi harga, BUKAN waviness median
-            chronos_volatility[i] = (q90[-1] - q10[-1]) / close[i]
+            chronos_volatility[i] = (q90[-1] - q10[-1]) / close_anchor
             
             # 3. Skewness: Bias arah distribusi probabilistik
             range_up = q90[-1] - q50[-1]
@@ -146,8 +149,8 @@ class ChronosForecaster:
             chronos_skewness[i] = (range_up - range_down) / (denom + 1e-12)
             
             # 4 & 5. Endpoint kuantil asli (dinormalisasi) untuk breach detection di alignment.py
-            chronos_q90_end[i] = q90[-1] / close[i]
-            chronos_q10_end[i] = q10[-1] / close[i]
+            chronos_q90_end[i] = q90[-1] / close_anchor
+            chronos_q10_end[i] = q10[-1] / close_anchor
             
         out = pd.DataFrame(index=df.index)
         out["chronos_trend"] = chronos_trend

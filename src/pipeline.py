@@ -6,6 +6,7 @@ serta Dilengkapi Class Weighting untuk Mengatasi Ketimpangan Label.
 """
 
 import os
+import sys
 import numpy as np
 import pandas as pd
 import xgboost as xgb
@@ -13,6 +14,12 @@ import warnings
 from sklearn.model_selection import train_test_split, KFold
 from sklearn.metrics import classification_report, accuracy_score
 from sklearn.utils.class_weight import compute_class_weight
+
+# Daftarkan direktori root dan src ke sys.path secara dinamis
+curr_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(curr_dir)
+sys.path.append(os.path.dirname(curr_dir))
+
 
 # Import modul internal kita
 from smc_features import load_ohlcv_ccxt, _synthetic_ohlcv
@@ -169,14 +176,20 @@ class HybridMLPipeline:
         
         n_bars = len(dataset)
         
-        # Definisikan interval uji chronological secara proporsional
+        # Definisikan interval uji chronological secara proporsional terhadap n_bars
+        # 50% awal untuk training fold 1, sisa 50% dibagi rata menjadi 3 test folds
+        min_train_bars = int(n_bars * 0.50)
+        remaining_bars = n_bars - min_train_bars
+        fold_size = int(remaining_bars / 3)
+        
         fold_splits = [
-            (500, 650),
-            (650, 800),
-            (800, n_bars)
+            (min_train_bars, min_train_bars + fold_size),
+            (min_train_bars + fold_size, min_train_bars + 2 * fold_size),
+            (min_train_bars + 2 * fold_size, n_bars)
         ]
         
         all_test_preds = []
+
         all_test_prob_success = []
         all_test_indices = []
         
@@ -196,10 +209,13 @@ class HybridMLPipeline:
             )
             
             # Pangkas test set fold ini agar tepat sesuai dengan test_end
-            te_end_idx = test_end - (train_end + 10)
-            if te_end_idx > 0:
-                X_te = X_te.iloc[:te_end_idx]
-                y_te = y_te.iloc[:te_end_idx]
+            te_length = test_end - (train_end + 10)
+            if te_length > 0:
+                X_te = X_te.iloc[:te_length]
+                y_te = y_te.iloc[:te_length]
+            else:
+                X_te = X_te.iloc[0:0]
+                y_te = y_te.iloc[0:0]
                 
             if len(X_tr) == 0 or len(X_te) == 0:
                 print(f"[-] Fold {fold_idx} dilewati karena data latihan/uji kosong.")
@@ -226,8 +242,11 @@ class HybridMLPipeline:
                     'n_jobs': -1
                 }
                 val_sz = int(len(X_tr) * 0.2)
-                X_t, X_v = X_tr.iloc[:-val_sz], X_tr.iloc[-val_sz:]
-                y_t, y_v = y_tr.iloc[:-val_sz], y_tr.iloc[-val_sz:]
+                # Purge validation boundary (40 bars) untuk mencegah kebocoran selama tuning
+                X_t = X_tr.iloc[:-val_sz - 40]
+                y_t = y_tr.iloc[:-val_sz - 40]
+                X_v = X_tr.iloc[-val_sz:]
+                y_v = y_tr.iloc[-val_sz:]
                 
                 t_cls = np.unique(y_t)
                 t_wts = compute_class_weight('balanced', classes=t_cls, y=y_t.to_numpy())
@@ -285,8 +304,11 @@ class HybridMLPipeline:
                 if len(X_m_tr) < 6: return 0.5
                 val_sz = int(len(X_m_tr) * 0.2)
                 if val_sz < 2: val_sz = 2
-                X_t, X_v = X_m_tr.iloc[:-val_sz], X_m_tr.iloc[-val_sz:]
-                y_t, y_v = y_m_tr[:-val_sz], y_m_tr[-val_sz:]
+                # Purge validation boundary (10 bars) pada active trades untuk meta-labeling tuning
+                X_t = X_m_tr.iloc[:-val_sz - 10] if len(X_m_tr) > val_sz + 10 else X_m_tr.iloc[:-val_sz]
+                y_t = y_m_tr[:-val_sz - 10] if len(y_m_tr) > val_sz + 10 else y_m_tr[:-val_sz]
+                X_v = X_m_tr.iloc[-val_sz:]
+                y_v = y_m_tr[-val_sz:]
                 
                 t_cls = np.unique(y_t)
                 if len(t_cls) < 2:
@@ -323,7 +345,13 @@ class HybridMLPipeline:
                 
             # Evaluasi fold out-of-sample
             te_preds = fold_base_model.predict(X_te)
-            te_prob_success = fold_meta_model.predict_proba(X_te)[:, 1]
+            
+            # Mencegah IndexError crash jika y_m_tr hanya memiliki 1 kelas
+            if len(m_classes) >= 2:
+                te_prob_success = fold_meta_model.predict_proba(X_te)[:, 1]
+            else:
+                sole_class = m_classes[0] if len(m_classes) > 0 else 0
+                te_prob_success = np.full(len(X_te), float(sole_class))
             
             all_test_preds.extend(te_preds)
             all_test_prob_success.extend(te_prob_success)
@@ -366,11 +394,13 @@ class HybridMLPipeline:
             import matplotlib.pyplot as plt
             
             close_test = dataset.loc[X_test.index, 'close']
-            prob_success = self.meta_model.predict_proba(X_test)[:, 1]
+            # Hapus penimpaan prob_success di sini untuk mencegah backtest leakage!
+            # Kita menggunakan array prob_success OOS murni yang dikumpulkan di line 341.
             
-            # Sinyal boolean berdasarkan threshold manajemen risiko
-            entries = (base_test_preds == 2) & (prob_success >= 0.45) # 2 = BUY
-            short_entries = (base_test_preds == 0) & (prob_success >= 0.60) # 0 = SELL
+            # Sinyal boolean berdasarkan threshold manajemen risiko (Konversi ke pandas Series untuk mendukung .shift)
+            entries = pd.Series((base_test_preds == 2) & (prob_success >= 0.45), index=close_test.index)
+            short_entries = pd.Series((base_test_preds == 0) & (prob_success >= 0.60), index=close_test.index)
+
             
             # --- KELLY POSITION SIZING ---
             # Formula Kelly: f* = p - (1-p)/b
@@ -394,18 +424,35 @@ class HybridMLPipeline:
                 # Batasi maksimum allocation 10% dan minimum 0%
                 kelly_sizes[idx] = np.clip(half_kelly, 0.0, 0.10)
                 
-            # Long-Only Portfolio simulation untuk mencegah kendala reversal pada SizeType.Percent
-            portfolio = vbt.Portfolio.from_signals(
-                close=close_test,
-                entries=entries,
-                exits=short_entries,
-                size=kelly_sizes,
-                size_type="percent",
-                fees=0.0006, # 0.06% Binance spot VIP 0
-                slippage=0.0001, # 0.01% slippage
-                freq="15min",
-                init_cash=10000.0
-            )
+            # Coba jalankan simulasi Dual-Sided (Long & Short) secara terintegrasi
+            try:
+                portfolio = vbt.Portfolio.from_signals(
+                    close=close_test,
+                    entries=entries,
+                    exits=short_entries | entries.shift(40).fillna(False), # auto-exit setelah 40 bar
+                    short_entries=short_entries,
+                    short_exits=entries | short_entries.shift(40).fillna(False), # auto-exit setelah 40 bar
+                    size=kelly_sizes,
+                    size_type="percent",
+                    fees=0.0006, # 0.06% Binance spot VIP 0
+                    slippage=0.0001, # 0.01% slippage
+                    freq="15min",
+                    init_cash=10000.0
+                )
+                print("[VBT-BACKTEST] Berhasil menjalankan simulasi Dual-Sided (Long & Short) Kuantitatif!")
+            except Exception as e:
+                print(f"[VBT-BACKTEST] Gagal membuat portfolio Dual-Sided ({e}). Menggunakan fallback Long-Only secara aman...")
+                portfolio = vbt.Portfolio.from_signals(
+                    close=close_test,
+                    entries=entries,
+                    exits=short_entries,
+                    size=kelly_sizes,
+                    size_type="percent",
+                    fees=0.0006,
+                    slippage=0.0001,
+                    freq="15min",
+                    init_cash=10000.0
+                )
             
             # Ekstrak Metrik
             total_return = portfolio.total_return() * 100
@@ -492,7 +539,7 @@ class HybridMLPipeline:
         
         # Demonstrasikan LLM Reasoning Gate *hanya* untuk titik LIVE sinyal terbaru di akhir data
         print("\n[PIPELINE] Mengevaluasi sinyal LIVE paling akhir menggunakan LLM Gatekeeper...")
-        prob_success = self.meta_model.predict_proba(X_test)[:, 1]
+        # Hapus penimpaan prob_success untuk mencegah leakage
         
         latest_idx = X_test.index[-1]
         latest_features = X_test.iloc[-1]
@@ -540,7 +587,7 @@ class HybridMLPipeline:
                 "symbol": self.symbol,
                 "timeframe": "15m",
                 "htf_structure": "Bullish Trend" if latest_features['htf_structure'] > 0 else ("Sideways / Neutral" if latest_features['htf_structure'] == 0 else "Bearish Trend"),
-                "dist_to_ob": f"{latest_features['dist_to_swing_high']*100:.2f}" if action == "SELL" else f"{latest_features['dist_to_swing_low']*100:.2f}",
+                "dist_to_ob": f"{latest_features['dist_to_unmitigated_bearish_ob']*100:.2f}" if action == "SELL" else f"{latest_features['dist_to_unmitigated_bullish_ob']*100:.2f}",
                 "chronos_direction": "Bullish Expansion" if latest_features['chronos_trend'] > 0 else "Bearish Contraction"
             }
             

@@ -52,14 +52,20 @@ def apply_triple_barrier_labeling(df: pd.DataFrame, tp_mult: float = 2.0, sl_mul
     
     # Hitung volatilitas dinamis (ATR)
     atr_series = calculate_atr(df, period=14)
-    # Gunakan bfill untuk menangani bar awal yang bernilai NaN
-    atr = atr_series.fillna(method='bfill').to_numpy()
+    atr = atr_series.to_numpy()
     
     labels = np.zeros(n, dtype=int)
     barrier_hits = []
     
     for i in range(n - timeout_bars):
         volatility = atr[i]
+        
+        # Mencegah look-ahead bias: Lewati bar awal di mana ATR belum valid (NaN)
+        if np.isnan(volatility):
+            labels[i] = 0
+            barrier_hits.append("insufficient_data")
+            continue
+
         
         # Level harga absolut untuk TP & SL
         tp_level = close[i] + (tp_mult * volatility)
