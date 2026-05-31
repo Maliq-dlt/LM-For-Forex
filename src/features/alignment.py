@@ -7,43 +7,9 @@ fitur probabilistik dari Amazon Chronos.
 
 import numpy as np
 import pandas as pd
-from smc_features import build_features
+from smc_features import build_features, calculate_premium_discount
 from forecasting.chronos_wrapper import ChronosForecaster
 
-def calculate_premium_discount(df_smc: pd.DataFrame, df_raw: pd.DataFrame) -> pd.DataFrame:
-    """
-    Menghitung Premium/Discount Zone berdasarkan konsep SMC/ICT yang objektif.
-    - Equilibrium (50%): Titik tengah dari Swing High dan Swing Low terkonfirmasi terakhir.
-    - Discount Zone (< 0.5): Harga saat ini berada di separuh bawah rentang swing. Cocok untuk BUY.
-    - Premium Zone (> 0.5): Harga saat ini berada di separuh atas rentang swing. Cocok untuk SELL.
-    """
-    df = df_smc.copy()
-    close = df_raw['close'].to_numpy()
-    
-    # Ambil level swing terkonfirmasi yang sedang berjalan (tidak bocor)
-    # dist_to_swing_high = (run_sh - close) / close  =>  run_sh = close * (1 + dist_to_swing_high)
-    dist_sh = df['dist_to_swing_high'].to_numpy()
-    dist_sl = df['dist_to_swing_low'].to_numpy()
-    
-    run_sh = close * (1.0 + dist_sh)
-    run_sl = close * (1.0 - dist_sl)
-    
-    # Hitung nilai persentase posisi harga dalam range swing (Premium / Discount)
-    # 0.0 = Tepat di Swing Low, 1.0 = Tepat di Swing High, 0.5 = Equilibrium
-    swing_range = run_sh - run_sl
-    # Cegah pembagian dengan nol
-    swing_range = np.where(swing_range <= 0, 1e-12, swing_range)
-    
-    premium_discount_pct = (close - run_sl) / swing_range
-    # Klip nilai agar tetap di rentang [0, 1] jika ada ekstrusi sementara
-    premium_discount_pct = np.clip(premium_discount_pct, 0.0, 1.0)
-    
-    df['premium_discount_pct'] = premium_discount_pct
-    df['in_discount'] = (premium_discount_pct < 0.5).astype(int)
-    df['in_premium'] = (premium_discount_pct > 0.5).astype(int)
-    df['in_equilibrium'] = (premium_discount_pct == 0.5).astype(int)
-    
-    return df
 
 def build_hybrid_dataset(
     df_low_tf: pd.DataFrame, 

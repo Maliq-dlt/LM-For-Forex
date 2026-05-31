@@ -125,6 +125,36 @@ def build_features(df: pd.DataFrame, k: int = 2) -> pd.DataFrame:
     return out
 
 
+def calculate_premium_discount(df_smc: pd.DataFrame, df_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Menghitung Premium/Discount Zone berdasarkan konsep SMC/ICT yang objektif.
+    - Equilibrium (50%): Titik tengah dari Swing High dan Swing Low terkonfirmasi terakhir.
+    - Discount Zone (< 0.5): Harga saat ini berada di separuh bawah rentang swing. Cocok untuk BUY.
+    - Premium Zone (> 0.5): Harga saat ini berada di separuh atas rentang swing. Cocok untuk SELL.
+    """
+    df = df_smc.copy()
+    close = df_raw['close'].to_numpy()
+    
+    dist_sh = df['dist_to_swing_high'].to_numpy()
+    dist_sl = df['dist_to_swing_low'].to_numpy()
+    
+    run_sh = close * (1.0 + dist_sh)
+    run_sl = close * (1.0 - dist_sl)
+    
+    swing_range = run_sh - run_sl
+    swing_range = np.where(swing_range <= 0, 1e-12, swing_range)
+    
+    premium_discount_pct = (close - run_sl) / swing_range
+    premium_discount_pct = np.clip(premium_discount_pct, 0.0, 1.0)
+    
+    df['premium_discount_pct'] = premium_discount_pct
+    df['in_discount'] = (premium_discount_pct < 0.5).astype(int)
+    df['in_premium'] = (premium_discount_pct > 0.5).astype(int)
+    df['in_equilibrium'] = (premium_discount_pct == 0.5).astype(int)
+    
+    return df
+
+
 def load_ohlcv_ccxt(symbol="BTC/USDT", timeframe="15m", limit=1500, exchange_id="binance"):
     """Ambil OHLCV dari exchange via ccxt (jalankan LOKAL, butuh internet).
     Return DataFrame berindeks waktu dengan kolom open/high/low/close/volume."""
