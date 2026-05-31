@@ -42,6 +42,35 @@ class MarketLLMReasoningGate:
             if not self.api_key:
                 print("[LLM-GATE] GEMINI_API_KEY tidak dikonfigurasi. Menggunakan mode Simulasi.")
 
+    def fetch_live_news(self) -> list:
+        """
+        Mengambil 5 berita fundamental pasar terhangat dari Yahoo Finance RSS.
+        Menggunakan penanganan error fallback jika koneksi internet terganggu.
+        """
+        import urllib.request
+        import xml.etree.ElementTree as ET
+        
+        url = "https://finance.yahoo.com/news/rss"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        news_list = []
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=5) as response:
+                xml_data = response.read()
+            root = ET.fromstring(xml_data)
+            for item in root.findall('.//item')[:5]:
+                title = item.find('title').text
+                pub_date = item.find('pubDate').text
+                news_list.append({"source": "Yahoo Finance RSS", "headline": f"{title} ({pub_date})"})
+            print(f"[LLM-GATE] Berhasil mengambil {len(news_list)} berita aktual dari Yahoo Finance.")
+        except Exception as e:
+            print(f"[LLM-GATE] Gagal mengambil berita RSS: {e}. Mengaktifkan Fallback News.")
+            news_list = [
+                {"source": "FRED Fallback", "headline": "US Inflation Rate cools down to 3.1% YoY (supporting assets)"},
+                {"source": "Economic Calendar Fallback", "headline": "Market anticipates upcoming Fed Interest Rate Decision with high volatility expected"}
+            ]
+        return news_list
+
     def generate_prompt(self, technical_metrics: dict, fundamental_sentiments: list) -> str:
         """ Menyusun instruksi prompt terstruktur untuk LLM. """
         prompt = f"""

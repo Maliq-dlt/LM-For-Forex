@@ -1,13 +1,11 @@
 """
 smc_features.py
-Extractor fitur SMC/ICT yang OBJEKTIF dan LEAK-FREE dari data OHLCV.
+Extractor fitur SMC/ICT & Harmonic Patterns yang OBJEKTIF dan LEAK-FREE dari data OHLCV.
 
 Prinsip penting (anti look-ahead bias):
   Sebuah swing di index i baru BISA dipastikan setelah k bar berikutnya (i+k).
   Jadi level swing hanya boleh dipakai mulai bar (i+k), bukan di bar i.
   Seluruh fitur di sini menghormati aturan itu.
-
-Kolom input wajib: open, high, low, close  (volume opsional)
 """
 
 import numpy as np
@@ -29,9 +27,174 @@ def detect_swings(df: pd.DataFrame, k: int = 2):
     return sh, sl
 
 
+def detect_harmonics_vectorized(df: pd.DataFrame, k: int = 2, tol: float = 0.08) -> pd.DataFrame:
+    """
+    Mendeteksi 5 Pola Harmonik Utama (Gartley, Butterfly, Bat, Crab, Cypher)
+    secara leak-free berdasarkan 4 titik swing historis terkonfirmasi (X, A, B, C)
+    dan harga close saat ini (D).
+    """
+    sh, sl = detect_swings(df, k)
+    highs = df['high'].to_numpy()
+    lows = df['low'].to_numpy()
+    close = df['close'].to_numpy()
+    n = len(df)
+    
+    bull_gartley = np.zeros(n, dtype=int)
+    bear_gartley = np.zeros(n, dtype=int)
+    bull_butterfly = np.zeros(n, dtype=int)
+    bear_butterfly = np.zeros(n, dtype=int)
+    bull_bat = np.zeros(n, dtype=int)
+    bear_bat = np.zeros(n, dtype=int)
+    bull_crab = np.zeros(n, dtype=int)
+    bear_crab = np.zeros(n, dtype=int)
+    bull_cypher = np.zeros(n, dtype=int)
+    bear_cypher = np.zeros(n, dtype=int)
+    
+    active_swings = []
+    
+    for i in range(n):
+        # Konfirmasi swing terjadi pada j = i - k
+        j = i - k
+        if j >= 0:
+            if sh[j]:
+                active_swings.append((j, highs[j], 1))
+            if sl[j]:
+                active_swings.append((j, lows[j], -1))
+        
+        if len(active_swings) < 4:
+            continue
+            
+        # Dapatkan 4 swing terkonfirmasi terakhir
+        s0, s1, s2, s3 = active_swings[-4:]
+        
+        # Harus berselang-seling (High, Low, High, Low / Low, High, Low, High)
+        if s0[2] == s1[2] or s1[2] == s2[2] or s2[2] == s3[2]:
+            continue
+            
+        X, A, B, C = s0[1], s1[1], s2[1], s3[1]
+        D = close[i]
+        
+        XA = abs(A - X)
+        AB = abs(B - A)
+        BC = abs(C - B)
+        XC = abs(C - X)
+        
+        if XA == 0 or AB == 0 or BC == 0 or XC == 0:
+            continue
+            
+        ratio_B = AB / XA
+        ratio_C = BC / AB
+        ratio_D_XA = abs(D - X) / XA
+        ratio_D_BC = abs(D - C) / BC
+        
+        is_bullish_sequence = (s0[2] == -1 and s1[2] == 1 and s2[2] == -1 and s3[2] == 1)
+        is_bearish_sequence = (s0[2] == 1 and s1[2] == -1 and s2[2] == 1 and s3[2] == -1)
+        
+        if is_bullish_sequence:
+            # 1. Gartley
+            if (abs(ratio_B - 0.618) <= tol and 
+                0.382 - tol <= ratio_C <= 0.786 + tol and
+                abs(ratio_D_XA - 0.786) <= tol and
+                1.27 - tol <= ratio_D_BC <= 1.618 + tol and
+                D < C):
+                bull_gartley[i] = 1
+                
+            # 2. Butterfly
+            if (abs(ratio_B - 0.786) <= tol and 
+                0.382 - tol <= ratio_C <= 0.886 + tol and
+                1.27 - tol <= ratio_D_XA <= 1.618 + tol and
+                1.618 - tol <= ratio_D_BC <= 2.618 + tol and
+                D < X):
+                bull_butterfly[i] = 1
+                
+            # 3. Bat
+            if (0.382 - tol <= ratio_B <= 0.50 + tol and 
+                0.382 - tol <= ratio_C <= 0.886 + tol and
+                abs(ratio_D_XA - 0.886) <= tol and
+                1.618 - tol <= ratio_D_BC <= 2.618 + tol and
+                D < C):
+                bull_bat[i] = 1
+                
+            # 4. Crab
+            if (0.382 - tol <= ratio_B <= 0.618 + tol and 
+                0.382 - tol <= ratio_C <= 0.886 + tol and
+                abs(ratio_D_XA - 1.618) <= tol and
+                2.24 - tol <= ratio_D_BC <= 3.618 + tol and
+                D < X):
+                bull_crab[i] = 1
+                
+            # 5. Cypher
+            ratio_C_XA = abs(C - X) / XA
+            ratio_D_XC = abs(D - X) / XC
+            if (0.382 - tol <= ratio_B <= 0.618 + tol and 
+                1.272 - tol <= ratio_C_XA <= 1.414 + tol and
+                abs(ratio_D_XC - 0.786) <= tol and
+                D > X):
+                bull_cypher[i] = 1
+                
+        elif is_bearish_sequence:
+            # 1. Gartley
+            if (abs(ratio_B - 0.618) <= tol and 
+                0.382 - tol <= ratio_C <= 0.786 + tol and
+                abs(ratio_D_XA - 0.786) <= tol and
+                1.27 - tol <= ratio_D_BC <= 1.618 + tol and
+                D > C):
+                bear_gartley[i] = 1
+                
+            # 2. Butterfly
+            if (abs(ratio_B - 0.786) <= tol and 
+                0.382 - tol <= ratio_C <= 0.886 + tol and
+                1.27 - tol <= ratio_D_XA <= 1.618 + tol and
+                1.618 - tol <= ratio_D_BC <= 2.618 + tol and
+                D > X):
+                bear_butterfly[i] = 1
+                
+            # 3. Bat
+            if (0.382 - tol <= ratio_B <= 0.50 + tol and 
+                0.382 - tol <= ratio_C <= 0.886 + tol and
+                abs(ratio_D_XA - 0.886) <= tol and
+                1.618 - tol <= ratio_D_BC <= 2.618 + tol and
+                D > C):
+                bear_bat[i] = 1
+                
+            # 4. Crab
+            if (0.382 - tol <= ratio_B <= 0.618 + tol and 
+                0.382 - tol <= ratio_C <= 0.886 + tol and
+                abs(ratio_D_XA - 1.618) <= tol and
+                2.24 - tol <= ratio_D_BC <= 3.618 + tol and
+                D > X):
+                bear_crab[i] = 1
+                
+            # 5. Cypher
+            ratio_C_XA = abs(C - X) / XA
+            ratio_D_XC = abs(D - X) / XC
+            if (0.382 - tol <= ratio_B <= 0.618 + tol and 
+                1.272 - tol <= ratio_C_XA <= 1.414 + tol and
+                abs(ratio_D_XC - 0.786) <= tol and
+                D < X):
+                bear_cypher[i] = 1
+                
+    out = pd.DataFrame(index=df.index)
+    out['bull_gartley'] = bull_gartley
+    out['bear_gartley'] = bear_gartley
+    out['bull_butterfly'] = bull_butterfly
+    out['bear_butterfly'] = bear_butterfly
+    out['bull_bat'] = bull_bat
+    out['bear_bat'] = bear_bat
+    out['bull_crab'] = bull_crab
+    out['bear_crab'] = bear_crab
+    out['bull_cypher'] = bull_cypher
+    out['bear_cypher'] = bear_cypher
+    out['harmonic_bullish_signal'] = (bull_gartley | bull_butterfly | bull_bat | bull_crab | bull_cypher)
+    out['harmonic_bearish_signal'] = (bear_gartley | bear_butterfly | bear_bat | bear_crab | bear_cypher)
+    return out
+
+
 def build_features(df: pd.DataFrame, k: int = 2) -> pd.DataFrame:
-    """Hitung fitur SMC/ICT dari OHLCV. Semua level swing dipakai mulai
-    bar konfirmasi (swing_index + k) → tidak ada kebocoran masa depan."""
+    """
+    Hitung fitur SMC/ICT & Harmonic Patterns dari OHLCV. Semua level swing dipakai mulai
+    bar konfirmasi (swing_index + k) → tidak ada kebocoran masa depan.
+    """
     df = df.copy()
     high = df["high"].to_numpy()
     low = df["low"].to_numpy()
@@ -55,6 +218,22 @@ def build_features(df: pd.DataFrame, k: int = 2) -> pd.DataFrame:
     brk_sl = np.nan
     last_sh = np.nan  # level persisten untuk jarak & sweep
     last_sl = np.nan
+    
+    # Simpan indeks swing terakhir
+    last_sh_idx = -1
+    last_sl_idx = -1
+
+    # Inisialisasi pelacakan Order Block (OB) unmitigated
+    # Format OB: {'top': float, 'bottom': float, 'type': 'bullish'/'bearish', 'has_fvg': bool, 'mitigated': bool}
+    active_obs = []
+
+    # Fair Value Gap (imbalance 3-candle) — pre-calculate agar leak-free
+    bull_fvg_series = (df["low"] > df["high"].shift(2)).fillna(False).to_numpy()
+    bear_fvg_series = (df["high"] < df["low"].shift(2)).fillna(False).to_numpy()
+
+    dist_to_unmitigated_bullish_ob = np.full(n, np.nan)
+    dist_to_unmitigated_bearish_ob = np.full(n, np.nan)
+    ob_fvg_confluence = np.zeros(n, dtype=int)
 
     for i in range(n):
         j = i - k  # swing di j baru terkonfirmasi saat bar i
@@ -62,9 +241,11 @@ def build_features(df: pd.DataFrame, k: int = 2) -> pd.DataFrame:
             if sh[j]:
                 brk_sh = high[j]
                 last_sh = high[j]
+                last_sh_idx = j
             if sl[j]:
                 brk_sl = low[j]
                 last_sl = low[j]
+                last_sl_idx = j
 
         # Liquidity sweep: wick menembus level, tapi CLOSE balik ke dalam (rejection)
         if not np.isnan(last_sl) and low[i] < last_sl and close[i] > last_sl:
@@ -73,6 +254,7 @@ def build_features(df: pd.DataFrame, k: int = 2) -> pd.DataFrame:
             sweep_down[i] = True
 
         # Structure break: CLOSE menembus level terkonfirmasi
+        created_ob = None
         if not np.isnan(brk_sh) and close[i] > brk_sh:
             if trend <= 0:
                 choch_up[i] = True       # pergantian karakter (reversal)
@@ -81,6 +263,19 @@ def build_features(df: pd.DataFrame, k: int = 2) -> pd.DataFrame:
             trend = 1
             if not np.isnan(brk_sl): last_sl = brk_sl
             brk_sh = np.nan
+            
+            # Form Valid Bullish OB di swing low terakhir sebelum breakout
+            if last_sl_idx != -1:
+                # Cek jika ada Bullish FVG antara j dan i (mitigation area)
+                has_fvg = bool(np.any(bull_fvg_series[last_sl_idx:i+1]))
+                created_ob = {
+                    'top': high[last_sl_idx],
+                    'bottom': low[last_sl_idx],
+                    'type': 'bullish',
+                    'has_fvg': has_fvg,
+                    'mitigated': False
+                }
+                
         if not np.isnan(brk_sl) and close[i] < brk_sl:
             if trend >= 0:
                 choch_down[i] = True
@@ -89,14 +284,69 @@ def build_features(df: pd.DataFrame, k: int = 2) -> pd.DataFrame:
             trend = -1
             if not np.isnan(brk_sh): last_sh = brk_sh
             brk_sl = np.nan
+            
+            # Form Valid Bearish OB di swing high terakhir sebelum breakout
+            if last_sh_idx != -1:
+                # Cek jika ada Bearish FVG antara j dan i
+                has_fvg = bool(np.any(bear_fvg_series[last_sh_idx:i+1]))
+                created_ob = {
+                    'top': high[last_sh_idx],
+                    'bottom': low[last_sh_idx],
+                    'type': 'bearish',
+                    'has_fvg': has_fvg,
+                    'mitigated': False
+                }
+
+        if created_ob is not None:
+            active_obs.append(created_ob)
+
+        # Update status mitigasi & invalidasi OB aktif secara realtime (leak-free)
+        remaining_obs = []
+        for zone in active_obs:
+            if zone['type'] == 'bullish':
+                # Mitigated jika terpantul (low di bawah/sama dengan batas atas OB)
+                if low[i] <= zone['top']:
+                    zone['mitigated'] = True
+                # Invalidated/Broken jika close menembus batas bawah OB
+                if close[i] < zone['bottom']:
+                    continue # Discard broken OB
+            else: # bearish
+                # Mitigated jika terpantul (high di atas/sama dengan batas bawah OB)
+                if high[i] >= zone['bottom']:
+                    zone['mitigated'] = True
+                # Invalidated/Broken jika close menembus batas atas OB
+                if close[i] > zone['top']:
+                    continue # Discard broken OB
+            remaining_obs.append(zone)
+        active_obs = remaining_obs
+
+        # Hitung jarak ke OB unmitigated (atau termitigasi tapi belum broken) terdekat
+        closest_bull_ob = None
+        closest_bear_ob = None
+        
+        for zone in active_obs:
+            if zone['type'] == 'bullish' and close[i] >= zone['top']:
+                if closest_bull_ob is None or zone['top'] > closest_bull_ob['top']:
+                    closest_bull_ob = zone
+            elif zone['type'] == 'bearish' and close[i] <= zone['bottom']:
+                if closest_bear_ob is None or zone['bottom'] < closest_bear_ob['bottom']:
+                    closest_bear_ob = zone
+
+        if closest_bull_ob is not None:
+            dist_to_unmitigated_bullish_ob[i] = (close[i] - closest_bull_ob['top']) / close[i]
+            # Konfluensi FVG: dekat dengan OB berkualitas tinggi
+            if closest_bull_ob['has_fvg'] and dist_to_unmitigated_bullish_ob[i] <= 0.01:
+                ob_fvg_confluence[i] = 1
+                
+        if closest_bear_ob is not None:
+            dist_to_unmitigated_bearish_ob[i] = (closest_bear_ob['bottom'] - close[i]) / close[i]
+            # Konfluensi FVG: dekat dengan OB berkualitas tinggi
+            if closest_bear_ob['has_fvg'] and dist_to_unmitigated_bearish_ob[i] <= 0.01:
+                ob_fvg_confluence[i] = -1
 
         structure[i] = trend
         run_sh[i] = last_sh
         run_sl[i] = last_sl
-
-    # Fair Value Gap (imbalance 3-candle) — vektor, leak-free (pakai i dan i-2)
-    bull_fvg = (df["low"] > df["high"].shift(2)).fillna(False).to_numpy()
-    bear_fvg = (df["high"] < df["low"].shift(2)).fillna(False).to_numpy()
 
     # Jarak ke level swing terkonfirmasi terakhir (dinormalisasi harga)
     dist_to_swing_high = (run_sh - close) / close   # >0: resistance di atas
@@ -118,12 +368,26 @@ def build_features(df: pd.DataFrame, k: int = 2) -> pd.DataFrame:
     out["choch_down"] = choch_down
     out["sweep_up"] = sweep_up
     out["sweep_down"] = sweep_down
-    out["bull_fvg"] = bull_fvg
-    out["bear_fvg"] = bear_fvg
+    out["bull_fvg"] = bull_fvg_series
+    out["bear_fvg"] = bear_fvg_series
     out["dist_to_swing_high"] = dist_to_swing_high
     out["dist_to_swing_low"] = dist_to_swing_low
     out["upper_wick_ratio"] = upper_wick_ratio
     out["lower_wick_ratio"] = lower_wick_ratio
+    
+    # Fitur Baru: OB Memory & Confluence
+    out["dist_to_unmitigated_bullish_ob"] = dist_to_unmitigated_bullish_ob
+    out["dist_to_unmitigated_bearish_ob"] = dist_to_unmitigated_bearish_ob
+    out["ob_fvg_confluence"] = ob_fvg_confluence
+    
+    # Isi NaN pada jarak OB dengan nilai default aman
+    out["dist_to_unmitigated_bullish_ob"] = out["dist_to_unmitigated_bullish_ob"].fillna(1.0)
+    out["dist_to_unmitigated_bearish_ob"] = out["dist_to_unmitigated_bearish_ob"].fillna(1.0)
+
+    # Deteksi & Gabungkan Fitur Harmonik
+    harmonics = detect_harmonics_vectorized(df, k)
+    out = out.join(harmonics)
+
     return out
 
 
@@ -158,9 +422,8 @@ def calculate_premium_discount(df_smc: pd.DataFrame, df_raw: pd.DataFrame) -> pd
 
 
 def load_ohlcv_ccxt(symbol="BTC/USDT", timeframe="15m", limit=1500, exchange_id="binance"):
-    """Ambil OHLCV dari exchange via ccxt (jalankan LOKAL, butuh internet).
-    Return DataFrame berindeks waktu dengan kolom open/high/low/close/volume."""
-    import ccxt  # pip install ccxt
+    """Ambil OHLCV dari exchange via ccxt (jalankan LOKAL, butuh internet)."""
+    import ccxt
     ex = getattr(ccxt, exchange_id)()
     raw = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
@@ -179,20 +442,19 @@ def _synthetic_ohlcv(n=600, seed=0):
     wick = np.abs(rng.normal(0, 0.0025, n))
     high = np.maximum(open_, close) * (1 + wick)
     low = np.minimum(open_, close) * (1 - wick)
-    idx = pd.date_range("2024-01-01", periods=n, freq="15min")
+    idx = pd.date_range("2026-01-01", periods=n, freq="15min")
     return pd.DataFrame({"open": open_, "high": high, "low": low, "close": close},
                         index=idx)
 
 
 if __name__ == "__main__":
-    df = _synthetic_ohlcv()
+    df = _synthetic_ohlcv(800)
     feats = build_features(df, k=2)
     print("Jumlah bar          :", len(df))
-    print("Swing high/low       :",
-          int(detect_swings(df, 2)[0].sum()), "/", int(detect_swings(df, 2)[1].sum()))
+    print("Swing Highs / Lows  :", int(detect_swings(df, 2)[0].sum()), "/", int(detect_swings(df, 2)[1].sum()))
     print("BOS up / down        :", int(feats.bos_up.sum()), "/", int(feats.bos_down.sum()))
-    print("CHoCH up / down      :", int(feats.choch_up.sum()), "/", int(feats.choch_down.sum()))
-    print("Sweep up / down      :", int(feats.sweep_up.sum()), "/", int(feats.sweep_down.sum()))
-    print("FVG bull / bear      :", int(feats.bull_fvg.sum()), "/", int(feats.bear_fvg.sum()))
-    print("\nContoh 8 baris fitur:")
-    print(feats.tail(8).to_string())
+    print("OB unmitigated bull / bear average dist:")
+    print(f"- Bullish OB: {feats['dist_to_unmitigated_bullish_ob'].mean():.4f}")
+    print(f"- Bearish OB: {feats['dist_to_unmitigated_bearish_ob'].mean():.4f}")
+    print("OB FVG Confluences  :", int((feats.ob_fvg_confluence != 0).sum()))
+    print("Cypher patterns bull / bear:", int(feats.bull_cypher.sum()), "/", int(feats.bear_cypher.sum()))
